@@ -18,7 +18,7 @@ A Telegram bot that asks for an output format after every uploaded image, conver
    docker compose up --build -d
    ```
 
-The admin panel is available at **http://37.27.84.251:5375/admin**. The health endpoint is `/health`.
+The admin panel is available at **http://localhost:5375/admin**. The health endpoint is `/health`.
 
 ## Supported output formats
 
@@ -37,6 +37,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 5375 --reload
 ```
 
 The bot uses long polling, so Telegram does not need inbound access to the server. SQLite data is kept at `DATA_DIR/converter.db`; Docker Compose persists `/app/data` in a named volume.
+
+For production, use strong, unique values for `ADMIN_PASSWORD` and
+`SESSION_SECRET`, terminate TLS at a reverse proxy, and set
+`SESSION_HTTPS_ONLY=true` so the session cookie is only sent over HTTPS.
 
 ## Tests
 

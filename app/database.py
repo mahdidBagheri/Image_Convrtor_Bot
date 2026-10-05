@@ -1,4 +1,7 @@
+"""Asynchronous SQLite persistence for users and conversion metrics."""
+
 from pathlib import Path
+
 import aiosqlite
 
 
@@ -14,10 +17,14 @@ CREATE TABLE IF NOT EXISTS conversions (
   input_bytes INTEGER NOT NULL, output_bytes INTEGER NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_conversions_created_at ON conversions(created_at);
+CREATE INDEX IF NOT EXISTS idx_conversions_telegram_id ON conversions(telegram_id);
 """
 
 
 class Database:
+    """Repository abstraction around the application's SQLite database."""
+
     def __init__(self, path: Path):
         self.path = path
 
@@ -37,22 +44,47 @@ class Database:
             )
             await db.commit()
 
-    async def record_conversion(self, telegram_id: int, source: str, destination: str,
-                                input_bytes: int, output_bytes: int) -> None:
+    async def record_conversion(
+        self,
+        telegram_id: int,
+        source: str,
+        destination: str,
+        input_bytes: int,
+        output_bytes: int,
+    ) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT INTO conversions (telegram_id, source_format, destination_format, input_bytes, output_bytes) VALUES (?, ?, ?, ?, ?)",
+                """INSERT INTO conversions
+                (telegram_id, source_format, destination_format, input_bytes, output_bytes)
+                VALUES (?, ?, ?, ?, ?)""",
                 (telegram_id, source, destination, input_bytes, output_bytes),
             )
             await db.commit()
 
-    async def dashboard(self) -> dict:
+    async def dashboard(self) -> dict[str, int | list[dict]]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            users = (await (await db.execute("SELECT COUNT(*) n FROM users")).fetchone())["n"]
-            conversions = (await (await db.execute("SELECT COUNT(*) n FROM conversions")).fetchone())["n"]
-            today = (await (await db.execute("SELECT COUNT(*) n FROM conversions WHERE date(created_at)=date('now')")).fetchone())["n"]
-            formats = await (await db.execute("SELECT destination_format format, COUNT(*) count FROM conversions GROUP BY destination_format ORDER BY count DESC")).fetchall()
+            users = (await (await db.execute("SELECT COUNT(*) n FROM users")).fetchone())[
+                "n"
+            ]
+            conversions = (
+                await (await db.execute("SELECT COUNT(*) n FROM conversions")).fetchone()
+            )["n"]
+            today = (
+                await (
+                    await db.execute(
+                        """SELECT COUNT(*) n FROM conversions
+                        WHERE date(created_at)=date('now')"""
+                    )
+                ).fetchone()
+            )["n"]
+            formats = await (
+                await db.execute(
+                    """SELECT destination_format format, COUNT(*) count
+                    FROM conversions GROUP BY destination_format
+                    ORDER BY count DESC"""
+                )
+            ).fetchall()
             recent = await (await db.execute("""SELECT c.*, u.username, u.first_name FROM conversions c
                 LEFT JOIN users u ON u.telegram_id=c.telegram_id ORDER BY c.id DESC LIMIT 20""")).fetchall()
             return {"users": users, "conversions": conversions, "today": today,
