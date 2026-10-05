@@ -1,0 +1,1 @@
+"""PixelShift image converter application."""
