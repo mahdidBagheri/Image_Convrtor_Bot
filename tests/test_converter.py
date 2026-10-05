@@ -1,5 +1,8 @@
 from io import BytesIO
+
+import pytest
 from PIL import Image
+
 from app.converter import convert_image
 
 
@@ -20,3 +23,13 @@ def test_flattens_transparency_for_jpeg():
     converted = Image.open(BytesIO(result))
     assert converted.format == "JPEG"
     assert converted.mode == "RGB"
+
+
+def test_rejects_unsupported_destination():
+    with pytest.raises(ValueError, match="Unsupported destination format"):
+        convert_image(sample_image(), "raw")
+
+
+def test_destination_is_case_insensitive():
+    result, _ = convert_image(sample_image("RGB"), "PNG")
+    assert Image.open(BytesIO(result)).format == "PNG"
