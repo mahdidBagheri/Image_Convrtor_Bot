@@ -11,6 +11,10 @@ docker compose up --build -d
 
 The React app is at `http://localhost:5173`; API docs are at `http://localhost:8000/docs`.
 
+## Admin console
+
+Set `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `ADMIN_SESSION_SECRET` before starting the API, then visit `http://localhost:8000/admin`. The console includes overview metrics, searchable conversion metadata, user credit adjustments, billing records, and a privacy/retention page. It intentionally never displays images: images are processed in memory and the database contains only account, payment, and conversion metadata.
+
 ## Billing and access rules
 
 - Each account receives three free conversions per UTC day.

@@ -13,6 +13,11 @@ class Settings:
     pro_price_cents: int = int(os.getenv("PRO_PRICE_CENTS", "30"))
     credit_pack_credits: int = int(os.getenv("CREDIT_PACK_CREDITS", "100"))
     credit_pack_price_cents: int = int(os.getenv("CREDIT_PACK_PRICE_CENTS", "100"))
+    # Keep administrator credentials separate from customer accounts.  The
+    # console is deliberately unavailable until both values are configured.
+    admin_username: str = os.getenv("ADMIN_USERNAME", "")
+    admin_password: str = os.getenv("ADMIN_PASSWORD", "")
+    admin_session_secret: str = os.getenv("ADMIN_SESSION_SECRET", os.getenv("JWT_SECRET", "change-this-in-production"))
 
 
 settings = Settings()

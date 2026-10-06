@@ -58,7 +58,7 @@ def create_dispatcher(database: Database, max_image_mb: int) -> Dispatcher:
 
     @router.message(CommandStart())
     async def start(message: Message):
-        await message.answer("👋 Send or forward an image (or an album) and I’ll ask which format you want.\n\nHEIC/HEIF input is supported. Output formats: JPEG, PNG, WEBP, GIF, BMP, TIFF and PDF.")
+        await message.answer("👋 Send or forward an image (or an album) and I’ll ask which format you want.\n\nPrivacy: your image is processed in memory and is never stored in our database.\n\nHEIC/HEIF input is supported. Output formats: JPEG, PNG, WEBP, GIF, BMP, TIFF and PDF.")
 
     @router.message(F.photo | F.document)
     async def receive_image(message: Message, bot: Bot):

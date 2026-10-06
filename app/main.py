@@ -3,14 +3,17 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import BytesIO
 import jwt, stripe
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from PIL import UnidentifiedImageError
+from starlette.middleware.sessions import SessionMiddleware
+from fastapi.templating import Jinja2Templates
 from .config import settings
 from .converter import EXTENSIONS, FORMATS, convert_image
 from .database import Conversion, Payment, Subscription, User, consume_allowance, get_session, initialize_database, refund_credit
@@ -21,6 +24,9 @@ async def lifespan(_: FastAPI):
     await initialize_database(); yield
 app = FastAPI(title="PixelShift API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_url], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(SessionMiddleware, secret_key=settings.admin_session_secret, https_only=False, same_site="lax")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
 class Credentials(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
@@ -35,6 +41,83 @@ async def current_user(request: Request, session: AsyncSession = Depends(get_ses
     return user
 @app.get("/health")
 async def health(): return {"status":"ok"}
+
+def admin_ready() -> bool:
+    return bool(settings.admin_username and settings.admin_password)
+
+def require_admin(request: Request):
+    if not admin_ready():
+        raise HTTPException(503, "Admin console is not configured")
+    if request.session.get("admin") != settings.admin_username:
+        return False
+    return True
+
+@app.get("/admin/login")
+async def admin_login_page(request: Request):
+    if not admin_ready():
+        return templates.TemplateResponse(request, "login.html", {"error": "Set ADMIN_USERNAME and ADMIN_PASSWORD to enable the console."}, status_code=503)
+    if require_admin(request):
+        return RedirectResponse("/admin", status_code=303)
+    return templates.TemplateResponse(request, "login.html", {"error": None})
+
+@app.post("/admin/login")
+async def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
+    if not admin_ready():
+        raise HTTPException(503, "Admin console is not configured")
+    # Constant-time comparison prevents a username/password timing oracle.
+    import secrets
+    if not (secrets.compare_digest(username, settings.admin_username) and secrets.compare_digest(password, settings.admin_password)):
+        return templates.TemplateResponse(request, "login.html", {"error": "Invalid administrator credentials."}, status_code=401)
+    request.session["admin"] = settings.admin_username
+    return RedirectResponse("/admin", status_code=303)
+
+@app.post("/admin/logout")
+async def admin_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/admin/login", status_code=303)
+
+async def admin_context(session: AsyncSession, search: str = "", page: int = 1):
+    page = max(page, 1)
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    users = await session.scalar(select(func.count(User.id))) or 0
+    conversions = await session.scalar(select(func.count(Conversion.id))) or 0
+    today_count = await session.scalar(select(func.count(Conversion.id)).where(Conversion.created_at >= today)) or 0
+    paid_revenue = await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(Payment.status == "paid")) or 0
+    recent = (await session.execute(select(Conversion, User.email).join(User, User.id == Conversion.user_id).order_by(Conversion.created_at.desc()).limit(20))).all()
+    formats = (await session.execute(select(Conversion.destination_format, func.count(Conversion.id).label("count")).group_by(Conversion.destination_format).order_by(func.count(Conversion.id).desc()).limit(8))).all()
+    conversion_query = select(Conversion, User.email).join(User, User.id == Conversion.user_id).order_by(Conversion.created_at.desc())
+    user_query = select(User).order_by(User.created_at.desc())
+    if search.strip():
+        term = f"%{search.strip()}%"
+        conversion_query = conversion_query.where(or_(User.email.ilike(term), Conversion.source_format.ilike(term), Conversion.destination_format.ilike(term), Conversion.charge_type.ilike(term)))
+        user_query = user_query.where(User.email.ilike(term))
+    limit, offset = 50, (page - 1) * 50
+    conversion_rows = (await session.execute(conversion_query.limit(limit).offset(offset))).all()
+    user_rows = (await session.execute(user_query.limit(limit).offset(offset))).scalars().all()
+    payments = (await session.execute(select(Payment, User.email).join(User, User.id == Payment.user_id).order_by(Payment.id.desc()).limit(100))).all()
+    return {"overview": {"users": users, "conversions": conversions, "today": today_count, "revenue": paid_revenue, "recent": recent, "formats": formats}, "conversions": conversion_rows, "users": user_rows, "payments": payments, "search": search, "page": page, "has_next": len(conversion_rows) == limit or len(user_rows) == limit}
+
+@app.get("/admin")
+@app.get("/admin/{tab}")
+async def admin_console(request: Request, tab: str = "overview", q: str = "", page: int = 1, session: AsyncSession = Depends(get_session)):
+    if not require_admin(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    if tab not in {"overview", "conversions", "users", "billing", "privacy"}:
+        raise HTTPException(404, "Unknown admin section")
+    context = await admin_context(session, q, page)
+    context.update({"request": request, "tab": tab, "admin_username": settings.admin_username})
+    return templates.TemplateResponse(request, "dashboard.html", context)
+
+@app.post("/admin/users/{user_id}/credits")
+async def admin_adjust_credits(request: Request, user_id: int, adjustment: int = Form(...), session: AsyncSession = Depends(get_session)):
+    if not require_admin(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    user = await session.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    user.credit_balance = max(0, user.credit_balance + adjustment)
+    await session.commit()
+    return RedirectResponse("/admin/users", status_code=303)
 @app.post("/api/auth/register")
 async def register(data:Credentials,session:AsyncSession=Depends(get_session)):
     email=data.email.lower()
