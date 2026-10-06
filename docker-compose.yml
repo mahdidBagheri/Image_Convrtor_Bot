@@ -18,14 +18,15 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://pixelshift:${POSTGRES_PASSWORD:-pixelshift}@db:5432/pixelshift
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5180}
       PORT: 8000
     depends_on:
       db: {condition: service_healthy}
-    ports: ["8000:8000"]
+    ports: ["8020:8000"]
   web:
     build: ./frontend
     restart: unless-stopped
     depends_on: [api]
-    ports: ["5173:80"]
+    ports: ["5180:80"]
 volumes:
   postgres-data:
