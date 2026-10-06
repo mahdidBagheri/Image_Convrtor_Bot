@@ -20,9 +20,9 @@ A Telegram bot that asks for an output format after every uploaded image, conver
 
 The admin panel is available at **http://37.27.84.251:5375/admin**. The health endpoint is `/health`.
 
-## Supported output formats
+## Supported formats
 
-JPEG, PNG, WEBP, GIF, BMP, TIFF and PDF are available from an inline keyboard. Telegram photos and image documents are accepted (up to `MAX_IMAGE_MB`, 20 MB by default). Pending uploads expire after 10 minutes.
+HEIC and HEIF files are accepted as inputs, including documents that Telegram labels with the generic `application/octet-stream` MIME type. JPEG, PNG, WEBP, GIF, BMP, TIFF and PDF are available as outputs from the inline keyboard. Telegram photos and image documents are accepted up to `MAX_IMAGE_MB` (20 MB by default). Pending uploads expire after 10 minutes.
 
 ## Local development
 

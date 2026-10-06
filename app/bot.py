@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from time import monotonic
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
@@ -7,6 +8,23 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 from PIL import UnidentifiedImageError
 from .converter import EXTENSIONS, FORMATS, convert_image
 from .database import Database
+
+
+HEIC_MIME_TYPES = {
+    "application/heic",
+    "application/heif",
+    "image/heic",
+    "image/heic-sequence",
+    "image/heif",
+    "image/heif-sequence",
+}
+
+
+def is_image_document(filename: str | None, mime_type: str | None) -> bool:
+    """Accept normal image MIME types and HEIC files sent with a generic MIME type."""
+    mime_type = (mime_type or "").lower()
+    suffix = Path(filename or "").suffix.lower()
+    return mime_type.startswith("image/") or mime_type in HEIC_MIME_TYPES or suffix in {".heic", ".heif"}
 
 
 @dataclass
@@ -21,14 +39,14 @@ def create_dispatcher(database: Database, max_image_mb: int) -> Dispatcher:
 
     @router.message(CommandStart())
     async def start(message: Message):
-        await message.answer("👋 Send me an image and I’ll ask which format you want.\n\nSupported: JPEG, PNG, WEBP, GIF, BMP, TIFF and PDF.")
+        await message.answer("👋 Send me an image and I’ll ask which format you want.\n\nHEIC input is supported. Output formats: JPEG, PNG, WEBP, GIF, BMP, TIFF and PDF.")
 
     @router.message(F.photo | F.document)
     async def receive_image(message: Message, bot: Bot):
         user = message.from_user
         await database.touch_user(user.id, user.username, user.first_name)
         item = message.photo[-1] if message.photo else message.document
-        if message.document and not (message.document.mime_type or "").startswith("image/"):
+        if message.document and not is_image_document(message.document.file_name, message.document.mime_type):
             await message.answer("That file does not look like an image. Please send an image file.")
             return
         if item.file_size and item.file_size > max_image_mb * 1024 * 1024:

@@ -1,5 +1,11 @@
 from io import BytesIO
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
+
+
+# Pillow does not ship a HEIC decoder. Register pillow-heif's decoder once when
+# this module is imported so HEIC/HEIF uploads follow the normal Pillow path.
+register_heif_opener()
 
 
 FORMATS = {"jpeg": "JPEG", "png": "PNG", "webp": "WEBP", "gif": "GIF", "bmp": "BMP", "tiff": "TIFF", "pdf": "PDF"}
