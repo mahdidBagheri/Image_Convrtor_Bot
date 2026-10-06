@@ -1,20 +1,18 @@
 from dataclasses import dataclass
-from pathlib import Path
 import os
 
 
 @dataclass(frozen=True)
 class Settings:
-    bot_token: str = os.getenv("BOT_TOKEN", "")
-    admin_username: str = os.getenv("ADMIN_USERNAME", "admin")
-    admin_password: str = os.getenv("ADMIN_PASSWORD", "change-me")
-    session_secret: str = os.getenv("SESSION_SECRET", "development-only-secret")
-    data_dir: Path = Path(os.getenv("DATA_DIR", "data"))
+    database_url: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://pixelshift:pixelshift@db:5432/pixelshift")
+    jwt_secret: str = os.getenv("JWT_SECRET", "change-this-in-production")
+    frontend_url: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
     max_image_mb: int = int(os.getenv("MAX_IMAGE_MB", "20"))
-
-    @property
-    def database_path(self) -> Path:
-        return self.data_dir / "converter.db"
+    stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
+    stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    pro_price_cents: int = int(os.getenv("PRO_PRICE_CENTS", "30"))
+    credit_pack_credits: int = int(os.getenv("CREDIT_PACK_CREDITS", "100"))
+    credit_pack_price_cents: int = int(os.getenv("CREDIT_PACK_PRICE_CENTS", "100"))
 
 
 settings = Settings()

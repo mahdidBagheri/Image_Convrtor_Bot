@@ -10,5 +10,5 @@ COPY app ./app
 RUN mkdir -p /app/data && useradd --create-home appuser && chown -R appuser:appuser /app
 USER appuser
 
-EXPOSE 5375
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5375"]
+EXPOSE 8000
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
