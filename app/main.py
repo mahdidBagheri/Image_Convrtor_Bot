@@ -76,8 +76,7 @@ async def admin_logout(request: Request):
     request.session.clear()
     return RedirectResponse("/admin/login", status_code=303)
 
-async def admin_context(session: AsyncSession, search: str = "", page: int = 1):
-    page = max(page, 1)
+async def admin_context(session: AsyncSession):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     users = await session.scalar(select(func.count(User.id))) or 0
     conversions = await session.scalar(select(func.count(Conversion.id))) or 0
@@ -85,17 +84,42 @@ async def admin_context(session: AsyncSession, search: str = "", page: int = 1):
     paid_revenue = await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(Payment.status == "paid")) or 0
     recent = (await session.execute(select(Conversion, User.email).join(User, User.id == Conversion.user_id).order_by(Conversion.created_at.desc()).limit(20))).all()
     formats = (await session.execute(select(Conversion.destination_format, func.count(Conversion.id).label("count")).group_by(Conversion.destination_format).order_by(func.count(Conversion.id).desc()).limit(8))).all()
-    conversion_query = select(Conversion, User.email).join(User, User.id == Conversion.user_id).order_by(Conversion.created_at.desc())
-    user_query = select(User).order_by(User.created_at.desc())
-    if search.strip():
-        term = f"%{search.strip()}%"
-        conversion_query = conversion_query.where(or_(User.email.ilike(term), Conversion.source_format.ilike(term), Conversion.destination_format.ilike(term), Conversion.charge_type.ilike(term)))
-        user_query = user_query.where(User.email.ilike(term))
-    limit, offset = 50, (page - 1) * 50
-    conversion_rows = (await session.execute(conversion_query.limit(limit).offset(offset))).all()
-    user_rows = (await session.execute(user_query.limit(limit).offset(offset))).scalars().all()
     payments = (await session.execute(select(Payment, User.email).join(User, User.id == Payment.user_id).order_by(Payment.id.desc()).limit(100))).all()
-    return {"overview": {"users": users, "conversions": conversions, "today": today_count, "revenue": paid_revenue, "recent": recent, "formats": formats}, "conversions": conversion_rows, "users": user_rows, "payments": payments, "search": search, "page": page, "has_next": len(conversion_rows) == limit or len(user_rows) == limit}
+    return {"overview": {"users": users, "conversions": conversions, "today": today_count, "revenue": paid_revenue, "recent": recent, "formats": formats}, "payments": payments}
+
+async def conversion_context(session: AsyncSession, search: str = "", page: int = 1):
+    """Return one page of metadata-only conversion audit records."""
+    page = max(page, 1)
+    limit = 50
+    query = select(Conversion, User.email).join(User, User.id == Conversion.user_id)
+    if search := search.strip():
+        term = f"%{search}%"
+        query = query.where(or_(
+            User.email.ilike(term),
+            Conversion.source_format.ilike(term),
+            Conversion.destination_format.ilike(term),
+            Conversion.charge_type.ilike(term),
+        ))
+    total = await session.scalar(select(func.count()).select_from(query.subquery())) or 0
+    rows = (await session.execute(
+        query.order_by(Conversion.created_at.desc(), Conversion.id.desc())
+        .limit(limit)
+        .offset((page - 1) * limit)
+    )).all()
+    return {
+        "conversions": rows,
+        "conversion_total": total,
+        "search": search,
+        "page": page,
+        "has_previous": page > 1,
+        "has_next": page * limit < total,
+    }
+
+async def users_context(session: AsyncSession, search: str = ""):
+    query = select(User).order_by(User.created_at.desc())
+    if search := search.strip():
+        query = query.where(User.email.ilike(f"%{search}%"))
+    return {"users": (await session.execute(query.limit(50))).scalars().all(), "search": search}
 
 @app.get("/admin")
 @app.get("/admin/{tab}")
@@ -104,7 +128,11 @@ async def admin_console(request: Request, tab: str = "overview", q: str = "", pa
         return RedirectResponse("/admin/login", status_code=303)
     if tab not in {"overview", "conversions", "users", "billing", "privacy"}:
         raise HTTPException(404, "Unknown admin section")
-    context = await admin_context(session, q, page)
+    context = await admin_context(session)
+    if tab == "conversions":
+        context.update(await conversion_context(session, q, page))
+    elif tab == "users":
+        context.update(await users_context(session, q))
     context.update({"request": request, "tab": tab, "admin_username": settings.admin_username})
     return templates.TemplateResponse(request, "dashboard.html", context)
 
