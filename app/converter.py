@@ -1,5 +1,11 @@
 from io import BytesIO
 from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
+
+
+# Register HEIC/HEIF with Pillow once at import time.  This lets the existing
+# conversion path treat Apple photos exactly like the other source formats.
+register_heif_opener(thumbnails=False)
 
 
 FORMATS = {"jpeg": "JPEG", "png": "PNG", "webp": "WEBP", "gif": "GIF", "bmp": "BMP", "tiff": "TIFF", "pdf": "PDF"}

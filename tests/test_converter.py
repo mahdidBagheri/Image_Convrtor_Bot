@@ -15,6 +15,16 @@ def test_converts_png_to_webp():
     assert Image.open(BytesIO(result)).format == "WEBP"
 
 
+def test_converts_heif_to_jpeg():
+    source = BytesIO()
+    Image.new("RGB", (12, 8), "red").save(source, "HEIF")
+
+    result, detected_source = convert_image(source.getvalue(), "jpeg")
+
+    assert detected_source == "HEIF"
+    assert Image.open(BytesIO(result)).format == "JPEG"
+
+
 def test_flattens_transparency_for_jpeg():
     result, _ = convert_image(sample_image(), "jpeg")
     converted = Image.open(BytesIO(result))
