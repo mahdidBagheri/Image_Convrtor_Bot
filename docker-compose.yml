@@ -23,6 +23,15 @@ services:
     depends_on:
       db: {condition: service_healthy}
     ports: ["8020:8000"]
+  bot:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.bot_runner"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pixelshift:${POSTGRES_PASSWORD:-pixelshift}@db:5432/pixelshift
+    depends_on:
+      db: {condition: service_healthy}
   web:
     build: ./frontend
     restart: unless-stopped

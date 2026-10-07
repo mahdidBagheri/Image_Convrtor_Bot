@@ -2,21 +2,24 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import BytesIO
+import logging
 import jwt, stripe
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, cast, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from PIL import UnidentifiedImageError
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.templating import Jinja2Templates
 from .config import settings
 from .converter import EXTENSIONS, FORMATS, convert_image
-from .database import Conversion, Payment, Subscription, User, consume_allowance, get_session, initialize_database, refund_credit
+from .database import Conversion, Payment, Subscription, TelegramConversion, TelegramProAccess, TelegramUsageEvent, TelegramUser, TelegramUserPreference, User, consume_allowance, get_session, initialize_database, refund_credit
 
 password_hash = PasswordHash.recommended()
 @asynccontextmanager
@@ -27,6 +30,17 @@ app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_url], allow_
 app.add_middleware(SessionMiddleware, secret_key=settings.admin_session_secret, https_only=False, same_site="lax")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+logger = logging.getLogger(__name__)
+
+
+async def notify_telegram_user(telegram_id: int, language: str, fa: str, en: str) -> None:
+    if not settings.bot_token:
+        return
+    try:
+        async with Bot(settings.bot_token) as bot:
+            await bot.send_message(telegram_id, fa if language == "fa" else en)
+    except TelegramAPIError:
+        logger.exception("Could not notify Telegram user %s", telegram_id)
 class Credentials(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
@@ -78,34 +92,154 @@ async def admin_logout(request: Request):
 
 async def admin_context(session: AsyncSession):
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    users = await session.scalar(select(func.count(User.id))) or 0
-    conversions = await session.scalar(select(func.count(Conversion.id))) or 0
-    today_count = await session.scalar(select(func.count(Conversion.id)).where(Conversion.created_at >= today)) or 0
+    website_users = await session.scalar(select(func.count(User.id))) or 0
+    telegram_users = await session.scalar(select(func.count(TelegramUser.telegram_id))) or 0
+    website_conversions = await session.scalar(select(func.count(Conversion.id))) or 0
+    telegram_conversions = await session.scalar(select(func.count(TelegramConversion.id))) or 0
+    website_today = await session.scalar(select(func.count(Conversion.id)).where(Conversion.created_at >= today)) or 0
+    telegram_today = await session.scalar(select(func.count(TelegramConversion.id)).where(TelegramConversion.created_at >= today)) or 0
     paid_revenue = await session.scalar(select(func.coalesce(func.sum(Payment.amount), 0)).where(Payment.status == "paid")) or 0
-    recent = (await session.execute(select(Conversion, User.email).join(User, User.id == Conversion.user_id).order_by(Conversion.created_at.desc()).limit(20))).all()
-    formats = (await session.execute(select(Conversion.destination_format, func.count(Conversion.id).label("count")).group_by(Conversion.destination_format).order_by(func.count(Conversion.id).desc()).limit(8))).all()
+    telegram_label = func.coalesce(
+        literal("@") + TelegramUser.username,
+        TelegramUser.first_name,
+        cast(TelegramUser.telegram_id, String),
+    )
+    activity = union_all(
+        select(
+            User.email.label("user"), Conversion.source_format, Conversion.destination_format,
+            Conversion.output_bytes, Conversion.created_at, literal("Website").label("channel"),
+        ).join(User, User.id == Conversion.user_id),
+        select(
+            telegram_label.label("user"), TelegramConversion.source_format,
+            TelegramConversion.destination_format, TelegramConversion.output_bytes,
+            TelegramConversion.created_at, literal("Telegram").label("channel"),
+        ).join(TelegramUser, TelegramUser.telegram_id == TelegramConversion.telegram_id),
+    ).subquery()
+    recent = (await session.execute(select(activity).order_by(activity.c.created_at.desc()).limit(20))).mappings().all()
+    format_rows = union_all(
+        select(Conversion.destination_format.label("format")),
+        select(TelegramConversion.destination_format.label("format")),
+    ).subquery()
+    formats = (await session.execute(
+        select(format_rows.c.format, func.count().label("count"))
+        .group_by(format_rows.c.format).order_by(func.count().desc()).limit(8)
+    )).all()
     payments = (await session.execute(select(Payment, User.email).join(User, User.id == Payment.user_id).order_by(Payment.id.desc()).limit(100))).all()
-    return {"overview": {"users": users, "conversions": conversions, "today": today_count, "revenue": paid_revenue, "recent": recent, "formats": formats}, "payments": payments}
+    return {"overview": {"users": website_users + telegram_users, "website_users": website_users,
+            "telegram_users": telegram_users, "conversions": website_conversions + telegram_conversions,
+            "today": website_today + telegram_today, "revenue": paid_revenue,
+            "recent": recent, "formats": formats}, "payments": payments}
+
+
+async def statistics_context(session: AsyncSession):
+    now = datetime.now(timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today - timedelta(days=6)
+    trend_start = today - timedelta(days=13)
+
+    total_users = await session.scalar(select(func.count(TelegramUser.telegram_id))) or 0
+    active_users = await session.scalar(select(func.count(func.distinct(TelegramConversion.telegram_id)))) or 0
+    daily_active = await session.scalar(select(func.count(func.distinct(TelegramConversion.telegram_id))).where(TelegramConversion.created_at >= today)) or 0
+    weekly_active = await session.scalar(select(func.count(func.distinct(TelegramConversion.telegram_id))).where(TelegramConversion.created_at >= week_start)) or 0
+    requests = await session.scalar(select(func.count(TelegramConversion.id))) or 0
+    requests_today = await session.scalar(select(func.count(TelegramConversion.id)).where(TelegramConversion.created_at >= today)) or 0
+    new_users_today = await session.scalar(select(func.count(TelegramUser.telegram_id)).where(TelegramUser.first_seen >= today)) or 0
+    bytes_processed = await session.scalar(select(func.coalesce(func.sum(TelegramConversion.input_bytes), 0))) or 0
+
+    request_rows = (await session.execute(
+        select(func.date(TelegramConversion.created_at), func.count(TelegramConversion.id),
+               func.count(func.distinct(TelegramConversion.telegram_id)))
+        .where(TelegramConversion.created_at >= trend_start)
+        .group_by(func.date(TelegramConversion.created_at))
+    )).all()
+    signup_rows = (await session.execute(
+        select(func.date(TelegramUser.first_seen), func.count(TelegramUser.telegram_id))
+        .where(TelegramUser.first_seen >= trend_start)
+        .group_by(func.date(TelegramUser.first_seen))
+    )).all()
+    request_by_day = {row[0]: (row[1], row[2]) for row in request_rows}
+    signup_by_day = {row[0]: row[1] for row in signup_rows}
+    trend = []
+    for offset in range(14):
+        day = (trend_start + timedelta(days=offset)).date()
+        day_requests, day_active = request_by_day.get(day, (0, 0))
+        trend.append({"date": day, "new_users": signup_by_day.get(day, 0),
+                      "active_users": day_active, "requests": day_requests})
+    max_requests = max((day["requests"] for day in trend), default=0)
+    max_new_users = max((day["new_users"] for day in trend), default=0)
+    for day in trend:
+        day["requests_height"] = (
+            max(4, day["requests"] / max_requests * 100) if day["requests"] else 0
+        )
+        day["new_users_height"] = (
+            max(4, day["new_users"] / max_new_users * 100) if day["new_users"] else 0
+        )
+
+    formats = (await session.execute(
+        select(TelegramConversion.destination_format, func.count(TelegramConversion.id).label("count"))
+        .group_by(TelegramConversion.destination_format)
+        .order_by(func.count(TelegramConversion.id).desc())
+    )).all()
+    recent_users = (await session.execute(
+        select(TelegramUser, func.count(TelegramConversion.id).label("requests"),
+               func.max(TelegramConversion.created_at).label("last_request"))
+        .outerjoin(TelegramConversion, TelegramConversion.telegram_id == TelegramUser.telegram_id)
+        .group_by(TelegramUser.telegram_id)
+        .order_by(TelegramUser.last_seen.desc()).limit(20)
+    )).all()
+    return {"statistics": {"total_users": total_users, "active_users": active_users,
+            "daily_active": daily_active, "weekly_active": weekly_active,
+            "requests": requests, "requests_today": requests_today,
+            "new_users_today": new_users_today, "bytes_processed": bytes_processed,
+            "active_rate": (active_users / total_users * 100) if total_users else 0,
+            "requests_per_active": (requests / active_users) if active_users else 0,
+            "trend": trend, "max_requests": max_requests,
+            "max_new_users": max_new_users, "formats": formats,
+            "recent_users": recent_users}}
 
 async def conversion_context(session: AsyncSession, search: str = "", page: int = 1):
     """Return one page of metadata-only conversion audit records."""
     page = max(page, 1)
     limit = 50
-    query = select(Conversion, User.email).join(User, User.id == Conversion.user_id)
+    telegram_label = func.coalesce(
+        literal("@") + TelegramUser.username,
+        TelegramUser.first_name,
+        cast(TelegramUser.telegram_id, String),
+    )
+    records = union_all(
+        select(
+            Conversion.id.label("record_id"), User.email.label("user"),
+            Conversion.source_format, Conversion.destination_format,
+            Conversion.input_bytes, Conversion.output_bytes,
+            Conversion.charge_type.label("usage"), Conversion.created_at,
+            literal("Website").label("channel"),
+        ).join(User, User.id == Conversion.user_id),
+        select(
+            TelegramConversion.id.label("record_id"), telegram_label.label("user"),
+            TelegramConversion.source_format, TelegramConversion.destination_format,
+            TelegramConversion.input_bytes, TelegramConversion.output_bytes,
+            func.coalesce(TelegramUsageEvent.plan, literal("bot")).label("usage"),
+            TelegramConversion.created_at,
+            literal("Telegram").label("channel"),
+        ).join(TelegramUser, TelegramUser.telegram_id == TelegramConversion.telegram_id)
+        .outerjoin(TelegramUsageEvent, TelegramUsageEvent.conversion_id == TelegramConversion.id),
+    ).subquery()
+    query = select(records)
     if search := search.strip():
         term = f"%{search}%"
         query = query.where(or_(
-            User.email.ilike(term),
-            Conversion.source_format.ilike(term),
-            Conversion.destination_format.ilike(term),
-            Conversion.charge_type.ilike(term),
+            records.c.user.ilike(term),
+            records.c.source_format.ilike(term),
+            records.c.destination_format.ilike(term),
+            records.c.usage.ilike(term),
+            records.c.channel.ilike(term),
         ))
     total = await session.scalar(select(func.count()).select_from(query.subquery())) or 0
     rows = (await session.execute(
-        query.order_by(Conversion.created_at.desc(), Conversion.id.desc())
+        query.order_by(records.c.created_at.desc(), records.c.record_id.desc())
         .limit(limit)
         .offset((page - 1) * limit)
-    )).all()
+    )).mappings().all()
     return {
         "conversions": rows,
         "conversion_total": total,
@@ -116,20 +250,40 @@ async def conversion_context(session: AsyncSession, search: str = "", page: int 
     }
 
 async def users_context(session: AsyncSession, search: str = ""):
+    now = datetime.now(timezone.utc)
     query = select(User).order_by(User.created_at.desc())
+    telegram_query = (
+        select(TelegramUser, func.count(TelegramConversion.id).label("requests"),
+               func.max(TelegramConversion.created_at).label("last_request"),
+               TelegramProAccess.expires_at.label("pro_expires_at"),
+               (TelegramProAccess.expires_at > now).label("is_pro"))
+        .outerjoin(TelegramConversion, TelegramConversion.telegram_id == TelegramUser.telegram_id)
+        .outerjoin(TelegramProAccess, TelegramProAccess.telegram_id == TelegramUser.telegram_id)
+        .group_by(TelegramUser.telegram_id, TelegramProAccess.telegram_id, TelegramProAccess.expires_at)
+        .order_by(TelegramUser.last_seen.desc())
+    )
     if search := search.strip():
         query = query.where(User.email.ilike(f"%{search}%"))
-    return {"users": (await session.execute(query.limit(50))).scalars().all(), "search": search}
+        telegram_query = telegram_query.where(or_(
+            TelegramUser.username.ilike(f"%{search}%"),
+            TelegramUser.first_name.ilike(f"%{search}%"),
+            cast(TelegramUser.telegram_id, String).ilike(f"%{search}%"),
+        ))
+    return {"users": (await session.execute(query.limit(50))).scalars().all(),
+            "telegram_users": (await session.execute(telegram_query.limit(100))).all(),
+            "search": search}
 
 @app.get("/admin")
 @app.get("/admin/{tab}")
 async def admin_console(request: Request, tab: str = "overview", q: str = "", page: int = 1, session: AsyncSession = Depends(get_session)):
     if not require_admin(request):
         return RedirectResponse("/admin/login", status_code=303)
-    if tab not in {"overview", "conversions", "users", "billing", "privacy"}:
+    if tab not in {"overview", "statistics", "conversions", "users", "billing", "privacy"}:
         raise HTTPException(404, "Unknown admin section")
     context = await admin_context(session)
-    if tab == "conversions":
+    if tab == "statistics":
+        context.update(await statistics_context(session))
+    elif tab == "conversions":
         context.update(await conversion_context(session, q, page))
     elif tab == "users":
         context.update(await users_context(session, q))
@@ -145,6 +299,80 @@ async def admin_adjust_credits(request: Request, user_id: int, adjustment: int =
         raise HTTPException(404, "User not found")
     user.credit_balance = max(0, user.credit_balance + adjustment)
     await session.commit()
+    return RedirectResponse("/admin/users", status_code=303)
+
+
+@app.post("/admin/telegram-users/{telegram_id}/pro")
+async def admin_toggle_telegram_pro(request: Request, telegram_id: int, action: str = Form("grant"), session: AsyncSession = Depends(get_session)):
+    if not require_admin(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    user = await session.get(TelegramUser, telegram_id)
+    if not user:
+        raise HTTPException(404, "Telegram user not found")
+    preference = await session.get(TelegramUserPreference, telegram_id)
+    language = preference.language if preference and preference.language in {"fa", "en"} else "fa"
+    access = await session.get(TelegramProAccess, telegram_id)
+    now = datetime.now(timezone.utc)
+    if action == "remove":
+        if access:
+            await session.delete(access)
+        notification = (
+            "دسترسی پرو حساب شما غیرفعال شد.",
+            "Your Pro access has been deactivated.",
+        )
+    elif action == "grant":
+        base = max(now, access.expires_at) if access and access.expires_at else now
+        expires_at = base + timedelta(days=30)
+        if access:
+            access.granted_at = now
+            access.expires_at = expires_at
+        else:
+            session.add(TelegramProAccess(
+                telegram_id=telegram_id,
+                granted_at=now,
+                expires_at=expires_at,
+            ))
+        notification = (
+            f"⭐ حساب شما به پرو ارتقا یافت. دسترسی پرو تا {expires_at:%Y-%m-%d %H:%M} UTC فعال است.",
+            f"⭐ Your account is now Pro. Pro access is active until {expires_at:%Y-%m-%d %H:%M} UTC.",
+        )
+    else:
+        raise HTTPException(400, "Unknown Pro action")
+    await session.commit()
+    await notify_telegram_user(telegram_id, language, *notification)
+    return RedirectResponse("/admin/users", status_code=303)
+
+
+@app.post("/admin/telegram-users/{telegram_id}/credits")
+async def admin_adjust_telegram_credits(
+    request: Request,
+    telegram_id: int,
+    adjustment: int = Form(...),
+    session: AsyncSession = Depends(get_session),
+):
+    if not require_admin(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    user = await session.scalar(
+        select(TelegramUser)
+        .where(TelegramUser.telegram_id == telegram_id)
+        .with_for_update()
+    )
+    if not user:
+        raise HTTPException(404, "Telegram user not found")
+    preference = await session.get(TelegramUserPreference, telegram_id)
+    language = preference.language if preference and preference.language in {"fa", "en"} else "fa"
+    previous = user.credit_balance
+    user.credit_balance = max(0, user.credit_balance + adjustment)
+    actual_adjustment = user.credit_balance - previous
+    balance = user.credit_balance
+    await session.commit()
+    if actual_adjustment:
+        await notify_telegram_user(
+            telegram_id,
+            language,
+            f"💰 اعتبار حساب شما {actual_adjustment:+,} تومان تغییر کرد. موجودی جدید: {balance:,} تومان.",
+            f"💰 Your credit changed by {actual_adjustment:+,} T. New balance: {balance:,} T.",
+        )
     return RedirectResponse("/admin/users", status_code=303)
 @app.post("/api/auth/register")
 async def register(data:Credentials,session:AsyncSession=Depends(get_session)):
